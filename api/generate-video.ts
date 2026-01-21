@@ -2,7 +2,7 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { GoogleAuth } from 'google-auth-library';
 
 export const config = {
-  maxDuration: 300, 
+  maxDuration: 300,
 };
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -32,7 +32,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const privateKey = process.env.GCP_PRIVATE_KEY?.replace(/\\n/g, '\n');
 
     if (!projectId || !clientEmail || !privateKey) {
-      console.error("Missing GCP Credentials in Environment Variables");
+      console.error('Missing GCP Credentials in Environment Variables');
       return res.status(500).json({ error: 'Server configuration error: Missing GCP Credentials.' });
     }
 
@@ -46,71 +46,104 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     });
 
     const client = await auth.getClient();
-    const accessToken = await client.getAccessToken();
+    const accessTokenResp = await client.getAccessToken();
+    const accessToken = typeof accessTokenResp === 'string' ? accessTokenResp : accessTokenResp?.token;
+
+    if (!accessToken) {
+      return res.status(500).json({ error: 'Failed to obtain access token' });
+    }
 
     // MODEL VEO 3.1 FAST
-    // You can override via Vercel env vars if needed.
     const location = process.env.VERTEX_LOCATION || 'us-central1';
-    const modelId = process.env.VEO_MODEL_ID || 'veo-3.1-fast-generate-001'; 
-    const endpoint = `https://${location}-aiplatform.googleapis.com/v1/projects/${projectId}/locations/${location}/publishers/google/models/${modelId}:predict`;
+    const modelId = process.env.VEO_MODEL_ID || 'veo-3.1-fast-generate-001';
+
+    // If someday modelId contains "preview", use v1beta1 + global host (same pattern)
+    const isPreview = /preview/i.test(modelId);
+    const apiVersion = isPreview ? 'v1beta1' : 'v1';
+    const host = isPreview ? 'aiplatform.googleapis.com' : `${location}-aiplatform.googleapis.com`;
+
+    const endpoint = `https://${host}/${apiVersion}/projects/${projectId}/locations/${location}/publishers/google/models/${modelId}:predict`;
 
     const base64Image = image.includes(',') ? image.split(',')[1] : image;
+    const mimeType = image.startsWith('data:image/png') ? 'image/png' : 'image/jpeg';
 
     const payload = {
       instances: [
         {
-          prompt: prompt,
+          prompt,
           image: {
-             bytesBase64Encoded: base64Image
-          }
-        }
+            bytesBase64Encoded: base64Image,
+            mimeType, // some endpoints accept/ignore; safe to include
+          },
+        },
       ],
       parameters: {
-        aspectRatio: aspectRatio || "9:16",
+        aspectRatio: aspectRatio || '9:16',
         sampleCount: 1,
-        // negativePrompt: "", 
-      }
+      },
     };
 
-    console.log(`Calling Vertex AI Veo Endpoint: ${modelId}`);
+    console.log(`Calling Vertex AI Veo Endpoint: ${endpoint}`);
 
     const response = await fetch(endpoint, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${accessToken.token}`,
+        Authorization: `Bearer ${accessToken}`,
         'Content-Type': 'application/json; charset=utf-8',
       },
       body: JSON.stringify(payload),
     });
 
-    const data = await response.json();
-
-    if (!response.ok) {
-      console.error("Vertex AI Error Response:", JSON.stringify(data));
-      throw new Error(data.error?.message || `Vertex AI API Failed with status ${response.status}`);
+    // SAFER parsing
+    const raw = await response.text();
+    let data: any;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      console.error('Veo: Non-JSON response from Vertex', {
+        status: response.status,
+        endpoint,
+        raw: raw.slice(0, 500),
+      });
+      throw new Error(`Non-JSON response from Vertex (${response.status}). Check endpoint/model/permissions.`);
     }
 
-    let videoBase64 = null;
-    if (data.predictions && data.predictions.length > 0) {
+    if (!response.ok) {
+      console.error('Vertex AI Error Response:', {
+        status: response.status,
+        endpoint,
+        error: data?.error,
+      });
+      throw new Error(data?.error?.message || `Vertex AI API Failed with status ${response.status}`);
+    }
+
+    let videoBase64: string | null = null;
+    if (data?.predictions && Array.isArray(data.predictions) && data.predictions.length > 0) {
       const prediction = data.predictions[0];
       if (typeof prediction === 'string') {
-          videoBase64 = prediction;
-      } else if (prediction.bytesBase64Encoded) {
-          videoBase64 = prediction.bytesBase64Encoded;
-      } else if (prediction.video?.bytesBase64Encoded) {
-          videoBase64 = prediction.video.bytesBase64Encoded;
+        videoBase64 = prediction;
+      } else if (prediction?.bytesBase64Encoded) {
+        videoBase64 = prediction.bytesBase64Encoded;
+      } else if (prediction?.video?.bytesBase64Encoded) {
+        videoBase64 = prediction.video.bytesBase64Encoded;
       }
     }
 
     if (!videoBase64) {
-      console.error("Unexpected Vertex AI response format:", JSON.stringify(data));
+      console.error('Unexpected Vertex AI response format:', {
+        endpoint,
+        data,
+      });
       return res.status(500).json({ error: 'No video data received from Vertex AI.' });
     }
 
-    return res.status(200).json({ video: `data:video/mp4;base64,${videoBase64}` });
-
+    return res.status(200).json({
+      video: `data:video/mp4;base64,${videoBase64}`,
+      modelUsed: modelId,
+      endpointUsed: endpoint,
+    });
   } catch (error: any) {
-    console.error("API Handler Error:", error);
+    console.error('API Handler Error:', error);
     return res.status(500).json({ error: error.message || 'Internal Server Error' });
   }
 }
