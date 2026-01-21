@@ -22,7 +22,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
-    const { image, prompt, modelKey, aspectRatio } = req.body;
+    const { image, prompt, modelKey } = req.body as {
+      image?: string;
+      prompt?: string;
+      modelKey?: string;
+      aspectRatio?: string;
+    };
 
     if (!image || !prompt) {
       return res.status(400).json({ error: 'Missing image or prompt' });
@@ -90,7 +95,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const inputMimeType = image.startsWith('data:image/png') ? 'image/png' : 'image/jpeg';
 
     // Vertex Gemini Payload
-    const payload: any = {
+    const payload = {
       contents: [
         {
           role: 'user',
@@ -110,9 +115,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       },
     };
 
-    // (optional) kalau kamu mau pakai aspectRatio di prompt, bisa tambahkan di prompt, bukan di config.
-    // aspectRatio tidak selalu supported sebagai field config untuk semua model.
-
     const apiRes = await fetch(endpoint, {
       method: 'POST',
       headers: {
@@ -124,11 +126,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     // SAFER parsing: avoid "Unexpected token <"
     const raw = await apiRes.text();
-    let data: any = null;
+    let data: any;
     try {
       data = JSON.parse(raw);
     } catch {
-      // non-JSON response (HTML, etc.)
       console.error('Non-JSON response from Vertex', {
         status: apiRes.status,
         endpoint,
@@ -142,4 +143,37 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         status: apiRes.status,
         endpoint,
         model: vertexModelId,
-        error: data?.err
+        error: data?.error,
+      });
+      throw new Error(data?.error?.message || 'Vertex AI Generation Failed');
+    }
+
+    // --- EXTRACT IMAGE ---
+    let resultBase64: string | null = null;
+    let outMimeType: string = 'image/png';
+
+    const parts = data?.candidates?.[0]?.content?.parts;
+    if (Array.isArray(parts)) {
+      for (const part of parts) {
+        if (part?.inlineData?.data) {
+          resultBase64 = part.inlineData.data;
+          outMimeType = part.inlineData.mimeType || outMimeType;
+          break;
+        }
+      }
+    }
+
+    if (!resultBase64) {
+      console.error('No inlineData image returned', { model: vertexModelId, endpoint, data });
+      throw new Error('Model did not return image bytes. Check that the model supports image output.');
+    }
+
+    return res.status(200).json({
+      image: `data:${outMimeType};base64,${resultBase64}`,
+      modelUsed: vertexModelId,
+    });
+  } catch (error: any) {
+    console.error('API Error:', error);
+    return res.status(500).json({ error: error.message || 'Internal Server Error' });
+  }
+}
